@@ -1,0 +1,915 @@
+import csv
+import json
+from collections import defaultdict
+from functools import lru_cache
+from itertools import combinations
+from pathlib import Path
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.spatial.transform import Rotation
+
+
+# --------------------------- Configuration ---------------------------
+
+DATA_DIR = Path(r"C:\Users\Athur\Downloads\NuScenes")
+VERSION_DIR = DATA_DIR / "v1.0-mini"
+OUTPUT_DIR = DATA_DIR / "multicamera_vo_baseline_results"
+
+CAMERAS = ("CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT")
+
+SIFT_FEATURES = 2500
+RATIO_TEST = 0.75
+MAX_CAMERA_OFFSET_US = 40_000
+MAX_DEPTH_M = 100.0
+STEREO_REPROJECTION_PX = 3.0
+STEREO_EPIPOLAR_RANSAC_PX = 2.5
+# Camera keyframes are asynchronous; retain independent per-view checks below.
+CALIBRATED_EPIPOLAR_PX = 4.0
+PNP_REPROJECTION_PX = 3.0
+MIN_PNP_INLIERS = 8
+ROTATION_GATE_DEG = 20.0
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+sift = cv2.SIFT_create(nfeatures=SIFT_FEATURES)
+matcher = cv2.BFMatcher(cv2.NORM_L2)
+
+
+# --------------------------- Metadata and helpers ---------------------------
+
+def load_json(name):
+    path = VERSION_DIR / name
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+samples = sorted(load_json("sample.json"), key=lambda s: s["timestamp"])
+sample_data_list = load_json("sample_data.json")
+calibrated_list = load_json("calibrated_sensor.json")
+ego_poses = load_json("ego_pose.json")
+
+sample_data_by_token = {r["token"]: r for r in sample_data_list}
+calibrated_by_token = {r["token"]: r for r in calibrated_list}
+ego_pose_by_token = {r["token"]: r for r in ego_poses}
+
+
+def body_pose_from_record(record):
+    """T_global_body at this record's timestamp; used only for evaluation."""
+    pose = ego_pose_by_token.get(record.get("ego_pose_token"))
+    if pose is None:
+        return None
+
+    q = pose["rotation"]  # nuScenes order is [w, x, y, z].
+    R_global_body = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
+    T = np.eye(4)
+    T[:3, :3] = R_global_body
+    T[:3, 3] = np.asarray(pose["translation"], dtype=np.float64)
+    return T
+
+
+def camera_calibration(record):
+    calib = calibrated_by_token[record["calibrated_sensor_token"]]
+    q = calib["rotation"]  # sensor-to-ego rotation, [w, x, y, z].
+    R_BC = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
+    t_BC = np.asarray(calib["translation"], dtype=np.float64)
+    R_CB = R_BC.T
+    t_CB = -R_CB @ t_BC
+    K = np.asarray(calib["camera_intrinsic"], dtype=np.float64)
+    P = K @ np.column_stack((R_CB, t_CB))
+    return {"K": K, "R_BC": R_BC, "t_BC": t_BC, "R_CB": R_CB, "P": P}
+
+
+@lru_cache(maxsize=9)
+def extract_features(filename):
+    image_path = DATA_DIR / filename
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise FileNotFoundError(f"Could not read image: {image_path}")
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    keypoints, descriptors = sift.detectAndCompute(gray, None)
+    return gray, keypoints, descriptors
+
+
+def mutual_ratio_matches(desc0, desc1):
+    """Ratio-test matches that also agree in the reverse matching direction."""
+    if desc0 is None or desc1 is None or len(desc0) < 2 or len(desc1) < 2:
+        return []
+
+    forward = matcher.knnMatch(desc0, desc1, k=2)
+    reverse = matcher.knnMatch(desc1, desc0, k=2)
+
+    fwd = [
+        m for pair in forward if len(pair) == 2
+        for m in [pair[0]]
+        if pair[0].distance < RATIO_TEST * pair[1].distance
+    ]
+    rev_pairs = [
+        (pair[0].trainIdx, pair[0].queryIdx)
+        for pair in reverse if len(pair) == 2
+        and pair[0].distance < RATIO_TEST * pair[1].distance
+    ]
+    reverse_set = set(rev_pairs)
+    return [m for m in fwd if (m.queryIdx, m.trainIdx) in reverse_set]
+
+
+def project_points(K, xyz_camera):
+    uv_h = (K @ xyz_camera.T).T
+    return uv_h[:, :2] / uv_h[:, 2:3]
+
+
+def skew_symmetric(vector):
+    x, y, z = vector
+    return np.array([
+        [0.0, -z, y],
+        [z, 0.0, -x],
+        [-y, x, 0.0],
+    ])
+
+
+def calibrated_fundamental_matrix(calib_a, calib_b):
+    """Return F mapping pixels in camera A to epipolar lines in camera B."""
+    R_Cb_Ca = calib_b["R_CB"] @ calib_a["R_BC"]
+    t_Cb_Ca = calib_b["R_CB"] @ (
+        calib_a["t_BC"] - calib_b["t_BC"]
+    )
+    essential = skew_symmetric(t_Cb_Ca) @ R_Cb_Ca
+    return (
+        np.linalg.inv(calib_b["K"]).T
+        @ essential
+        @ np.linalg.inv(calib_a["K"])
+    )
+
+
+def calibrated_sampson_errors(F, uv_a, uv_b):
+    points_a = np.column_stack((uv_a, np.ones(len(uv_a))))
+    points_b = np.column_stack((uv_b, np.ones(len(uv_b))))
+    F_points_a = (F @ points_a.T).T
+    Ft_points_b = (F.T @ points_b.T).T
+    numerator = np.abs(np.sum(points_b * F_points_a, axis=1))
+    denominator = np.sqrt(
+        F_points_a[:, 0] ** 2 + F_points_a[:, 1] ** 2
+        + Ft_points_b[:, 0] ** 2 + Ft_points_b[:, 1] ** 2
+    )
+    errors = np.full(len(uv_a), np.inf, dtype=np.float64)
+    valid = denominator > 1e-12
+    errors[valid] = numerator[valid] / denominator[valid]
+    return errors
+
+
+def rotation_error_deg(R1, R2):
+    return float(np.degrees(Rotation.from_matrix(R1 @ R2.T).magnitude()))
+
+
+def max_camera_offset_us(bundle):
+    front_time = bundle["records"]["CAM_FRONT"]["timestamp"]
+    return max(
+        abs(bundle["records"][cam]["timestamp"] - front_time)
+        for cam in CAMERAS
+    )
+
+
+sensors = load_json("sensor.json")
+sensor_by_token = {sensor["token"]: sensor for sensor in sensors}
+
+channel_by_calibration = {}
+for calib in calibrated_list:
+    sensor = sensor_by_token[calib["sensor_token"]]
+    channel_by_calibration[calib["token"]] = sensor["channel"]
+
+keyframes_by_sample = defaultdict(dict)
+for record in sample_data_list:
+    if not record.get("is_key_frame", False):
+        continue
+
+    channel = channel_by_calibration.get(record["calibrated_sensor_token"])
+    if channel in CAMERAS and record.get("sample_token"):
+        keyframes_by_sample[record["sample_token"]][channel] = record
+
+samples_by_scene = defaultdict(list)
+for sample in samples:
+    camera_records = keyframes_by_sample.get(sample["token"], {})
+    if all(camera in camera_records for camera in CAMERAS):
+        samples_by_scene[sample["scene_token"]].append(
+            (sample, camera_records)
+        )
+
+if not samples_by_scene:
+    raise RuntimeError(
+        "No sample has keyframe records for all three cameras. "
+        "Check that sample.json and sample_data.json are from the same nuScenes version."
+    )
+
+scene_token = min(
+    samples_by_scene,
+    key=lambda token: min(item[0]["timestamp"] for item in samples_by_scene[token]),
+)
+scene_items = sorted(
+    samples_by_scene[scene_token],
+    key=lambda item: item[0]["timestamp"],
+)
+bundles = [
+    {"sample": sample, "records": records}
+    for sample, records in scene_items
+]
+
+# --------------------------- Stereo landmark map ---------------------------
+
+def triangulate_landmarks(bundle, bundle_index, map_role):
+    features = {}
+    calibrations = {}
+    landmarks_by_camera = {cam: {} for cam in CAMERAS}
+    pair_stats = []
+
+    for cam in CAMERAS:
+        record = bundle["records"][cam]
+        gray, keypoints, descriptors = extract_features(record["filename"])
+        features[cam] = {
+            "gray": gray,
+            "keypoints": keypoints,
+            "descriptors": descriptors,
+            "record": record,
+        }
+        calibrations[cam] = camera_calibration(record)
+
+    # This treats the three views as one rigid stereo rig at a common instant.
+    # Timestamp offsets are logged and bounded, but not motion-compensated.
+    if max_camera_offset_us(bundle) > MAX_CAMERA_OFFSET_US:
+        for cam_a, cam_b in combinations(CAMERAS, 2):
+            pair_stats.append({
+                "bundle_index": bundle_index,
+                "map_role": map_role,
+                "camera_a": cam_a,
+                "camera_b": cam_b,
+                "mutual_matches": 0,
+                "fundamental_ransac_inliers": 0,
+                "calibrated_epipolar_inliers": 0,
+                "finite_triangulations": 0,
+                "positive_depth_triangulations": 0,
+                "reprojection_inliers": 0,
+                "failure_reason": "camera_timestamp_offset_exceeds_limit",
+            })
+        return features, landmarks_by_camera, calibrations, pair_stats
+
+    for cam_a, cam_b in combinations(CAMERAS, 2):
+        fa, fb = features[cam_a], features[cam_b]
+        matches = mutual_ratio_matches(fa["descriptors"], fb["descriptors"])
+        stats = {
+            "bundle_index": bundle_index,
+            "map_role": map_role,
+            "camera_a": cam_a,
+            "camera_b": cam_b,
+            "mutual_matches": len(matches),
+            "fundamental_ransac_inliers": 0,
+            "calibrated_epipolar_inliers": 0,
+            "finite_triangulations": 0,
+            "positive_depth_triangulations": 0,
+            "reprojection_inliers": 0,
+            "failure_reason": "",
+        }
+
+        if len(matches) < 8:
+            stats["failure_reason"] = "too_few_mutual_matches"
+            pair_stats.append(stats)
+            continue
+
+        uv_a = np.float64([fa["keypoints"][m.queryIdx].pt for m in matches])
+        uv_b = np.float64([fb["keypoints"][m.trainIdx].pt for m in matches])
+        try:
+            _, ransac_mask = cv2.findFundamentalMat(
+                uv_a,
+                uv_b,
+                cv2.FM_RANSAC,
+                STEREO_EPIPOLAR_RANSAC_PX,
+                0.999,
+            )
+        except cv2.error as exc:
+            stats["failure_reason"] = f"fundamental_ransac_error: {exc}"
+            pair_stats.append(stats)
+            continue
+
+        if ransac_mask is None:
+            stats["failure_reason"] = "fundamental_ransac_failed"
+            pair_stats.append(stats)
+            continue
+
+        ransac_inliers = ransac_mask.reshape(-1).astype(bool)
+        stats["fundamental_ransac_inliers"] = int(ransac_inliers.sum())
+        calibrated_F = calibrated_fundamental_matrix(
+            calibrations[cam_a], calibrations[cam_b]
+        )
+        calibrated_inliers = (
+            calibrated_sampson_errors(calibrated_F, uv_a, uv_b)
+            < CALIBRATED_EPIPOLAR_PX
+        )
+        geometric_inliers = ransac_inliers & calibrated_inliers
+        stats["calibrated_epipolar_inliers"] = int(geometric_inliers.sum())
+        if stats["calibrated_epipolar_inliers"] < 8:
+            stats["failure_reason"] = "too_few_calibrated_epipolar_inliers"
+            pair_stats.append(stats)
+            continue
+
+        geometric_indices = np.flatnonzero(geometric_inliers)
+        uv_a_geometric = uv_a[geometric_indices]
+        uv_b_geometric = uv_b[geometric_indices]
+
+        X_h = cv2.triangulatePoints(
+            calibrations[cam_a]["P"],
+            calibrations[cam_b]["P"],
+            uv_a_geometric.T,
+            uv_b_geometric.T,
+        )
+        w = X_h[3]
+        finite_w = np.abs(w) > 1e-9
+        X_B = np.full((len(geometric_indices), 3), np.nan, dtype=np.float64)
+        X_B[finite_w] = (X_h[:3, finite_w] / w[finite_w]).T
+        finite = finite_w & np.isfinite(X_B).all(axis=1)
+        stats["finite_triangulations"] = int(finite.sum())
+
+        ca, cb = calibrations[cam_a], calibrations[cam_b]
+        X_Ca = (ca["R_CB"] @ (X_B - ca["t_BC"]).T).T
+        X_Cb = (cb["R_CB"] @ (X_B - cb["t_BC"]).T).T
+
+        valid = (
+            finite
+            & (X_Ca[:, 2] > 0.1) & (X_Cb[:, 2] > 0.1)
+            & (X_Ca[:, 2] < MAX_DEPTH_M) & (X_Cb[:, 2] < MAX_DEPTH_M)
+        )
+        stats["positive_depth_triangulations"] = int(valid.sum())
+
+        indices = np.flatnonzero(valid)
+        err_a = np.full(len(geometric_indices), np.inf)
+        err_b = np.full(len(geometric_indices), np.inf)
+        if len(indices):
+            err_a[indices] = np.linalg.norm(
+                project_points(ca["K"], X_Ca[indices])
+                - uv_a_geometric[indices],
+                axis=1,
+            )
+            err_b[indices] = np.linalg.norm(
+                project_points(cb["K"], X_Cb[indices])
+                - uv_b_geometric[indices],
+                axis=1,
+            )
+
+        valid &= (err_a < STEREO_REPROJECTION_PX) & (
+            err_b < STEREO_REPROJECTION_PX
+        )
+        stats["reprojection_inliers"] = int(valid.sum())
+        if not stats["reprojection_inliers"]:
+            stats["failure_reason"] = "no_valid_triangulations"
+        pair_stats.append(stats)
+
+        for idx in np.flatnonzero(valid):
+            match = matches[geometric_indices[idx]]
+            xyz = X_B[idx].copy()
+            quality = float(err_a[idx] + err_b[idx])
+            for cam, kp_idx in (
+                (cam_a, match.queryIdx),
+                (cam_b, match.trainIdx),
+            ):
+                old = landmarks_by_camera[cam].get(kp_idx)
+                if old is None or quality < old[1]:
+                    landmarks_by_camera[cam][kp_idx] = (xyz, quality)
+
+    return features, landmarks_by_camera, calibrations, pair_stats
+
+
+# --------------------------- PnP motion estimation ---------------------------
+
+def estimate_camera_motion(camera, anchor_features, anchor_landmarks, target_bundle):
+    f0 = anchor_features[camera]
+    record1 = target_bundle["records"][camera]
+    gray1, keypoints1, desc1 = extract_features(record1["filename"])
+    record0 = f0["record"]
+    dt = (record1["timestamp"] - record0["timestamp"]) / 1e6
+
+    result = {
+        "camera": camera,
+        "dt_seconds": dt,
+        "anchor_landmarks": 0,
+        "klt_tracks": 0,
+        "descriptor_matches_added": 0,
+        "correspondences": 0,
+        "pnp_ransac_inliers": 0,
+        "pnp_inliers": 0,
+        "success": False,
+        "reason": "",
+        "pnp_refinement_error": "",
+        "R": None,
+        "t": None,
+        "median_reprojection_px": "",
+    }
+
+    if dt <= 0:
+        result["reason"] = "nonpositive_camera_time_interval"
+        return result
+
+    landmarks = anchor_landmarks[camera]
+    result["anchor_landmarks"] = len(landmarks)
+    keypoints0 = f0["keypoints"]
+    observations = {}
+
+    landmark_indices = [i for i in landmarks if i < len(keypoints0)]
+    if landmark_indices:
+        points0 = np.float32(
+            [keypoints0[i].pt for i in landmark_indices]
+        ).reshape(-1, 1, 2)
+
+        lk_params = {
+            "winSize": (31, 31),
+            "maxLevel": 4,
+            "criteria": (
+                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 40, 0.01
+            ),
+        }
+        points1, status_f, _ = cv2.calcOpticalFlowPyrLK(
+            f0["gray"], gray1, points0, None, **lk_params
+        )
+
+        if points1 is not None and status_f is not None:
+            points0_back, status_b, _ = cv2.calcOpticalFlowPyrLK(
+                gray1, f0["gray"], points1, None, **lk_params
+            )
+            if points0_back is not None and status_b is not None:
+                p0 = points0.reshape(-1, 2)
+                p1 = points1.reshape(-1, 2)
+                p0b = points0_back.reshape(-1, 2)
+                fb_error = np.linalg.norm(p0b - p0, axis=1)
+                h, w = gray1.shape
+                inside = (
+                    (p1[:, 0] >= 0) & (p1[:, 0] < w)
+                    & (p1[:, 1] >= 0) & (p1[:, 1] < h)
+                )
+                good = (
+                    status_f.reshape(-1).astype(bool)
+                    & status_b.reshape(-1).astype(bool)
+                    & (fb_error < 1.5)
+                    & inside
+                    & np.isfinite(p1).all(axis=1)
+                )
+                for local_idx in np.flatnonzero(good):
+                    kp_idx = landmark_indices[local_idx]
+                    xyz, _ = landmarks[kp_idx]
+                    observations[kp_idx] = (xyz, p1[local_idx])
+                result["klt_tracks"] = len(observations)
+
+    # Mutual descriptor matches augment KLT, but do not replace a checked track.
+    for match in mutual_ratio_matches(f0["descriptors"], desc1):
+        kp_idx = match.queryIdx
+        if kp_idx in landmarks and kp_idx not in observations:
+            xyz, _ = landmarks[kp_idx]
+            observations[kp_idx] = (
+                xyz, np.asarray(keypoints1[match.trainIdx].pt, dtype=np.float64)
+            )
+            result["descriptor_matches_added"] += 1
+
+    result["correspondences"] = len(observations)
+    if len(observations) < MIN_PNP_INLIERS:
+        result["reason"] = "fewer_correspondences_than_required_inliers"
+        return result
+
+    object_points = np.asarray(
+        [v[0] for v in observations.values()], dtype=np.float32
+    )
+    image_points = np.asarray(
+        [v[1] for v in observations.values()], dtype=np.float32
+    )
+    K = camera_calibration(record1)["K"]
+
+    try:
+        ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+            object_points,
+            image_points,
+            K,
+            None,
+            iterationsCount=600,
+            reprojectionError=PNP_REPROJECTION_PX,
+            confidence=0.999,
+            flags=cv2.SOLVEPNP_EPNP,
+        )
+    except cv2.error as exc:
+        result["reason"] = f"pnp_error: {exc}"
+        return result
+
+    n_inliers = 0 if inliers is None else len(inliers)
+    result["pnp_ransac_inliers"] = n_inliers
+    if not ok or inliers is None or n_inliers < MIN_PNP_INLIERS:
+        result["reason"] = "pnp_failed_or_too_few_inliers"
+        return result
+
+    inlier_idx = inliers.ravel()
+    try:
+        refined, rvec_refined, tvec_refined = cv2.solvePnP(
+            object_points[inlier_idx],
+            image_points[inlier_idx],
+            K,
+            None,
+            rvec,
+            tvec,
+            useExtrinsicGuess=True,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        if refined:
+            rvec, tvec = rvec_refined, tvec_refined
+    except cv2.error as exc:
+        result["pnp_refinement_error"] = str(exc)
+
+    R_Ctarget_Banchor, _ = cv2.Rodrigues(rvec)
+    t_Ctarget_Banchor = tvec.reshape(3)
+
+    projected, _ = cv2.projectPoints(
+        object_points[inlier_idx], rvec, tvec, K, None
+    )
+    residuals = np.linalg.norm(
+        projected.reshape(-1, 2) - image_points[inlier_idx], axis=1
+    )
+    target_points = (
+        R_Ctarget_Banchor @ object_points[inlier_idx].T
+    ).T + t_Ctarget_Banchor
+    valid_inliers = (
+        np.isfinite(target_points).all(axis=1)
+        & (target_points[:, 2] > 0.1)
+        & np.isfinite(residuals)
+        & (residuals < PNP_REPROJECTION_PX)
+    )
+    inlier_idx = inlier_idx[valid_inliers]
+    residuals = residuals[valid_inliers]
+    result["pnp_inliers"] = len(inlier_idx)
+    if result["pnp_inliers"] < MIN_PNP_INLIERS:
+        result["reason"] = "too_few_positive_depth_reprojection_inliers"
+        return result
+
+    calib = camera_calibration(record1)
+    # Convert PnP's target-camera coordinates to target-body coordinates.
+    R_Btarget_Banchor = calib["R_BC"] @ R_Ctarget_Banchor
+    t_Btarget_Banchor = calib["R_BC"] @ t_Ctarget_Banchor + calib["t_BC"]
+
+    result.update({
+        "success": True,
+        "reason": "",
+        "R": R_Btarget_Banchor,
+        "t": t_Btarget_Banchor,
+        "median_reprojection_px": float(np.median(residuals)),
+    })
+    return result
+
+
+def fuse_motion(estimates):
+    candidates = [e for e in estimates if e["success"]]
+    if not candidates:
+        return None, []
+
+    reference = max(candidates, key=lambda e: e["pnp_inliers"])
+    R_ref, t_ref = reference["R"], reference["t"]
+    translation_gate = max(1.5, 0.35 * np.linalg.norm(t_ref) + 0.75)
+
+    accepted = []
+    for e in candidates:
+        trans_err = float(np.linalg.norm(e["t"] - t_ref))
+        rot_err = rotation_error_deg(e["R"], R_ref)
+        e["fusion_accepted"] = (
+            trans_err <= translation_gate and rot_err <= ROTATION_GATE_DEG
+        )
+        e["fusion_translation_disagreement_m"] = trans_err
+        e["fusion_rotation_disagreement_deg"] = rot_err
+        if e["fusion_accepted"]:
+            accepted.append(e)
+
+    weights = np.asarray(
+        [max(e["pnp_inliers"], 1) for e in accepted], dtype=np.float64
+    )
+    weights /= weights.sum()
+    t = np.sum(
+        np.asarray([e["t"] for e in accepted]) * weights[:, None], axis=0
+    )
+    R = Rotation.from_matrix(
+        np.asarray([e["R"] for e in accepted])
+    ).mean(weights=weights).as_matrix()
+
+    return {
+        "R": R,
+        "t": t,
+        "accepted_cameras": [e["camera"] for e in accepted],
+    }, accepted
+
+
+# --------------------------- Run VO; ground truth is not used here ---------------------------
+
+first_features, first_landmarks, first_calibs, stereo_stats = (
+    triangulate_landmarks(bundles[0], 0, "initial")
+)
+stereo_rows = list(stereo_stats)
+anchor_idx = 0
+anchor_features = first_features
+anchor_landmarks = first_landmarks
+anchor_pose_world = np.eye(4)
+
+trajectory = [{
+    "bundle_index": 0,
+    "timestamp": bundles[0]["sample"]["timestamp"],
+    "anchor_index": 0,
+    "max_camera_offset_ms": max_camera_offset_us(bundles[0]) / 1000.0,
+    "pose_estimated": True,
+    "x_m": 0.0,
+    "y_m": 0.0,
+    "z_m": 0.0,
+}]
+
+camera_rows = []
+motion_rows = []
+estimated_transforms = []
+
+for target_idx in range(1, len(bundles)):
+    target = bundles[target_idx]
+    anchor = bundles[anchor_idx]
+    camera_estimates = []
+
+    for camera in CAMERAS:
+        estimate = estimate_camera_motion(
+            camera, anchor_features, anchor_landmarks, target
+        )
+        estimate["anchor_bundle_index"] = anchor_idx
+        estimate["target_bundle_index"] = target_idx
+        estimate["fusion_accepted"] = False
+        estimate["fusion_translation_disagreement_m"] = ""
+        estimate["fusion_rotation_disagreement_deg"] = ""
+
+        # Per-camera relative-pose diagnostic against that camera's exact
+        # image timestamps. This is evaluation only, never estimator input.
+        if estimate["success"]:
+            T_GA = body_pose_from_record(anchor["records"][camera])
+            T_GT = body_pose_from_record(target["records"][camera])
+            if T_GA is not None and T_GT is not None:
+                T_target_anchor_gt = np.linalg.inv(T_GT) @ T_GA
+                estimate["gt_translation_error_m"] = float(np.linalg.norm(
+                    estimate["t"] - T_target_anchor_gt[:3, 3]
+                ))
+                estimate["gt_rotation_error_deg"] = rotation_error_deg(
+                    estimate["R"], T_target_anchor_gt[:3, :3]
+                )
+            else:
+                estimate["gt_translation_error_m"] = ""
+                estimate["gt_rotation_error_deg"] = ""
+        else:
+            estimate["gt_translation_error_m"] = ""
+            estimate["gt_rotation_error_deg"] = ""
+
+        camera_rows.append({
+            "anchor_bundle_index": anchor_idx,
+            "target_bundle_index": target_idx,
+            "camera": camera,
+            "dt_seconds": estimate["dt_seconds"],
+            "camera_offset_anchor_ms": (
+                anchor["records"][camera]["timestamp"]
+                - anchor["records"]["CAM_FRONT"]["timestamp"]
+            ) / 1000.0,
+            "camera_offset_target_ms": (
+                target["records"][camera]["timestamp"]
+                - target["records"]["CAM_FRONT"]["timestamp"]
+            ) / 1000.0,
+            "anchor_landmarks": estimate["anchor_landmarks"],
+            "klt_tracks": estimate["klt_tracks"],
+            "descriptor_matches_added": estimate["descriptor_matches_added"],
+            "correspondences": estimate["correspondences"],
+            "pnp_ransac_inliers": estimate["pnp_ransac_inliers"],
+            "pnp_inliers": estimate["pnp_inliers"],
+            "median_reprojection_px": estimate["median_reprojection_px"],
+            "success": estimate["success"],
+            "reason": estimate["reason"],
+            "pnp_refinement_error": estimate["pnp_refinement_error"],
+            "fusion_accepted": estimate["fusion_accepted"],
+            "fusion_translation_disagreement_m": "",
+            "fusion_rotation_disagreement_deg": "",
+            "gt_translation_error_m": estimate["gt_translation_error_m"],
+            "gt_rotation_error_deg": estimate["gt_rotation_error_deg"],
+        })
+        camera_estimates.append(estimate)
+
+    fused, accepted = fuse_motion(camera_estimates)
+
+    # Update the per-camera CSV rows with fusion-consistency decisions.
+    row_start = len(camera_rows) - len(camera_estimates)
+    for i, estimate in enumerate(camera_estimates):
+        camera_rows[row_start + i]["fusion_accepted"] = estimate["fusion_accepted"]
+        camera_rows[row_start + i]["fusion_translation_disagreement_m"] = (
+            estimate["fusion_translation_disagreement_m"]
+        )
+        camera_rows[row_start + i]["fusion_rotation_disagreement_deg"] = (
+            estimate["fusion_rotation_disagreement_deg"]
+        )
+
+    if fused is None:
+        motion_rows.append({
+            "anchor_bundle_index": anchor_idx,
+            "target_bundle_index": target_idx,
+            "success": False,
+            "accepted_cameras": "",
+            "reason": "no_camera_pnp_succeeded",
+            "translation_x_m": "",
+            "translation_y_m": "",
+            "translation_z_m": "",
+        })
+        trajectory.append({
+            "bundle_index": target_idx,
+            "timestamp": target["sample"]["timestamp"],
+            "anchor_index": anchor_idx,
+            "max_camera_offset_ms": max_camera_offset_us(target) / 1000.0,
+            "pose_estimated": False,
+            "x_m": "",
+            "y_m": "",
+            "z_m": "",
+        })
+        continue
+
+    T_target_anchor = np.eye(4)
+    T_target_anchor[:3, :3] = fused["R"]
+    T_target_anchor[:3, 3] = fused["t"]
+
+    # PnP transform maps anchor-body coordinates into target-body coordinates.
+    target_pose_world = anchor_pose_world @ np.linalg.inv(T_target_anchor)
+    position = target_pose_world[:3, 3]
+
+    estimated_transforms.append({
+        "anchor_bundle_index": anchor_idx,
+        "target_bundle_index": target_idx,
+        "R": fused["R"].copy(),
+        "t": fused["t"].copy(),
+    })
+    motion_rows.append({
+        "anchor_bundle_index": anchor_idx,
+        "target_bundle_index": target_idx,
+        "success": True,
+        "accepted_cameras": ";".join(fused["accepted_cameras"]),
+        "reason": "",
+        "translation_x_m": fused["t"][0],
+        "translation_y_m": fused["t"][1],
+        "translation_z_m": fused["t"][2],
+    })
+    trajectory.append({
+        "bundle_index": target_idx,
+        "timestamp": target["sample"]["timestamp"],
+        "anchor_index": anchor_idx,
+        "max_camera_offset_ms": max_camera_offset_us(target) / 1000.0,
+        "pose_estimated": True,
+        "x_m": position[0],
+        "y_m": position[1],
+        "z_m": position[2],
+    })
+
+    # Refresh only after a successful pose and a usable new map. If motion
+    # estimation fails, the previous anchor remains available for relocalizing
+    # against later samples.
+    new_features, new_landmarks, _, new_stats = triangulate_landmarks(
+        target, target_idx, "anchor_refresh"
+    )
+    stereo_rows.extend(new_stats)
+    landmark_count = max(
+        (len(v) for v in new_landmarks.values()), default=0
+    )
+    if landmark_count >= MIN_PNP_INLIERS:
+        anchor_idx = target_idx
+        anchor_features = new_features
+        anchor_landmarks = new_landmarks
+        anchor_pose_world = target_pose_world
+
+
+# --------------------------- Ground-truth evaluation only ---------------------------
+
+gt_positions = []
+gt_rotations = []
+for bundle in bundles:
+    T = body_pose_from_record(bundle["records"]["CAM_FRONT"])
+    if T is None:
+        gt_positions.append([np.nan, np.nan, np.nan])
+        gt_rotations.append(np.full((3, 3), np.nan))
+    else:
+        gt_positions.append(T[:3, 3])
+        gt_rotations.append(T[:3, :3])
+
+gt_positions = np.asarray(gt_positions, dtype=np.float64)
+gt_rotations = np.asarray(gt_rotations, dtype=np.float64)
+if not np.isfinite(gt_positions[0]).all():
+    raise RuntimeError("Ground-truth pose missing for the first sample.")
+
+# Express GT in the initial vehicle frame; no trajectory fitting/alignment.
+gt_relative = (
+    gt_rotations[0].T @ (gt_positions - gt_positions[0]).T
+).T
+
+vo_positions = np.full((len(bundles), 3), np.nan, dtype=np.float64)
+for row in trajectory:
+    if row["pose_estimated"]:
+        i = row["bundle_index"]
+        vo_positions[i] = [row["x_m"], row["y_m"], row["z_m"]]
+
+evaluation_rows = []
+for i, bundle in enumerate(bundles):
+    valid = np.isfinite(vo_positions[i]).all() and np.isfinite(gt_relative[i]).all()
+    evaluation_rows.append({
+        "bundle_index": i,
+        "timestamp": bundle["sample"]["timestamp"],
+        "pose_estimated": bool(np.isfinite(vo_positions[i]).all()),
+        "max_camera_offset_ms": max_camera_offset_us(bundle) / 1000.0,
+        "gt_x_m_initial_vehicle_frame": gt_relative[i, 0],
+        "gt_y_m_initial_vehicle_frame": gt_relative[i, 1],
+        "gt_z_m_initial_vehicle_frame": gt_relative[i, 2],
+        "vo_x_m": vo_positions[i, 0] if np.isfinite(vo_positions[i]).all() else "",
+        "vo_y_m": vo_positions[i, 1] if np.isfinite(vo_positions[i]).all() else "",
+        "vo_z_m": vo_positions[i, 2] if np.isfinite(vo_positions[i]).all() else "",
+        "position_error_xy_m": (
+            float(np.linalg.norm(vo_positions[i, :2] - gt_relative[i, :2]))
+            if valid else ""
+        ),
+        "position_error_3d_m": (
+            float(np.linalg.norm(vo_positions[i] - gt_relative[i]))
+            if valid else ""
+        ),
+    })
+
+
+def write_csv(path, rows):
+    if not rows:
+        return
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+write_csv(OUTPUT_DIR / "per_camera_diagnostics.csv", camera_rows)
+write_csv(OUTPUT_DIR / "relative_motion.csv", motion_rows)
+write_csv(OUTPUT_DIR / "trajectory_vs_ground_truth.csv", evaluation_rows)
+write_csv(OUTPUT_DIR / "stereo_pair_diagnostics.csv", stereo_rows)
+
+valid_gt = np.isfinite(gt_relative[:, :2]).all(axis=1)
+valid_vo = np.isfinite(vo_positions[:, :2]).all(axis=1)
+
+plt.figure(figsize=(10, 8))
+if valid_gt.sum() >= 2:
+    plt.plot(
+        gt_relative[valid_gt, 0], gt_relative[valid_gt, 1],
+        ".-", label="nuScenes ground truth",
+    )
+if valid_vo.sum() >= 2:
+    plt.plot(
+        vo_positions[valid_vo, 0], vo_positions[valid_vo, 1],
+        "o-", markersize=3, label="Multi-camera VO",
+    )
+plt.scatter([0], [0], marker="s", label="Shared start")
+plt.xlabel("X in initial vehicle frame (m)")
+plt.ylabel("Y in initial vehicle frame (m)")
+plt.title("Multi-camera VO vs nuScenes ground truth")
+plt.axis("equal")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "trajectory_comparison.png", dpi=160)
+plt.show()
+
+errors = [
+    r["position_error_xy_m"] for r in evaluation_rows
+    if r["position_error_xy_m"] != ""
+]
+print(f"Estimated positions: {int(valid_vo.sum())}/{len(bundles)}")
+if errors:
+    print(f"XY position RMSE: {np.sqrt(np.mean(np.square(errors))):.3f} m")
+print(f"Results saved to: {OUTPUT_DIR}")
+
+import csv
+from collections import Counter
+from pathlib import Path
+
+out = Path(r"C:\Users\Athur\Downloads\NuScenes\multicamera_vo_baseline_results")
+
+with (out / "trajectory_vs_ground_truth.csv").open(
+    newline="", encoding="utf-8"
+) as f:
+    trajectory = list(csv.DictReader(f))
+
+estimated = [r for r in trajectory if r["pose_estimated"].lower() == "true"]
+print(f"Estimated {len(estimated)} / {len(trajectory)} positions")
+print("Last estimated bundle:", estimated[-1]["bundle_index"])
+print("Final bundle:", trajectory[-1]["bundle_index"])
+print("Last estimated timestamp:", estimated[-1]["timestamp"])
+print("Final timestamp:", trajectory[-1]["timestamp"])
+
+with (out / "per_camera_diagnostics.csv").open(
+    newline="", encoding="utf-8"
+) as f:
+    diagnostics = list(csv.DictReader(f))
+
+failures = [r for r in diagnostics if r["success"].lower() != "true"]
+print("Per-camera failures by reason:")
+for reason, count in Counter(r["reason"] for r in failures).most_common():
+    print(f"  {reason or '(no reason)'}: {count}")
+for camera in CAMERAS:
+    camera_failures = [r for r in failures if r["camera"] == camera]
+    if not camera_failures:
+        continue
+    targets_by_reason = defaultdict(list)
+    for row in camera_failures:
+        targets_by_reason[row["reason"]].append(row["target_bundle_index"])
+    for reason, targets in targets_by_reason.items():
+        print(f"  {camera} target indices ({reason}): {', '.join(targets)}")
