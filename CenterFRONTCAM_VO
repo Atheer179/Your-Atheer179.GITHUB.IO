@@ -1,0 +1,300 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import glob
+import csv
+
+# ============================================================
+# 1. PATHS - CHANGE THESE TWO PATHS ONLY
+# ============================================================
+
+IMAGE_DIR = r"C:\Users\Athur\Downloads\NuScenes\samples\CAM_FRONT"
+OUTPUT_DIR = r"C:\Users\Athur\Downloads\NuScenes\CAM_FRONT_results"
+
+FEATURE_DIR = os.path.join(OUTPUT_DIR, "features")
+MATCH_DIR = os.path.join(OUTPUT_DIR, "matches")
+
+os.makedirs(FEATURE_DIR, exist_ok=True)
+os.makedirs(MATCH_DIR, exist_ok=True)
+
+# ============================================================
+# 2. PARAMETERS
+# ============================================================
+
+N_FEATURES = 2000
+RATIO_THRESHOLD = 0.75
+RANSAC_THRESHOLD = 1.0
+
+# nuScenes CAM_FRONT intrinsic matrix.
+# This is the calibration for the standard nuScenes CAM_FRONT.
+# If your dataset sample uses different calibration, load K from its JSON.
+K = np.array([
+    [1266.417203046554, 0.0, 816.2670197447984],
+    [0.0, 1266.417203046554, 491.50706579294757],
+    [0.0, 0.0, 1.0]
+], dtype=np.float64)
+
+# ============================================================
+# 3. LOAD ALL IMAGES
+# ============================================================
+
+image_paths = sorted(
+    glob.glob(os.path.join(IMAGE_DIR, "*.jpg"))
+    + glob.glob(os.path.join(IMAGE_DIR, "*.jpeg"))
+    + glob.glob(os.path.join(IMAGE_DIR, "*.png"))
+)
+
+if len(image_paths) < 2:
+    raise FileNotFoundError(
+        f"Found {len(image_paths)} images in:\n{IMAGE_DIR}\n"
+        "Check IMAGE_DIR and make sure it points to the folder "
+        "containing the CAM_FRONT image files."
+    )
+
+print("Total images found:", len(image_paths))
+
+# ============================================================
+# 4. SIFT FEATURE EXTRACTION FOR EVERY IMAGE
+# ============================================================
+
+sift = cv2.SIFT_create(nfeatures=N_FEATURES)
+
+all_keypoints = []
+all_descriptors = []
+feature_rows = []
+valid_images = []
+
+for i, path in enumerate(image_paths):
+    image = cv2.imread(path)
+
+    if image is None:
+        print("Skipping unreadable image:", path)
+        continue
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    keypoints, descriptors = sift.detectAndCompute(gray, None)
+
+    if descriptors is None:
+        descriptors = np.empty((0, 128), dtype=np.float32)
+
+    kp_array = np.array([
+        [
+            kp.pt[0], kp.pt[1], kp.size,
+            kp.angle, kp.response, kp.octave
+        ]
+        for kp in keypoints
+    ], dtype=np.float32).reshape(-1, 6)
+
+    feature_name = os.path.splitext(os.path.basename(path))[0] + ".npz"
+    feature_path = os.path.join(FEATURE_DIR, feature_name)
+
+    np.savez_compressed(
+        feature_path,
+        keypoints=kp_array,
+        descriptors=descriptors,
+        K=K
+    )
+
+    valid_images.append(path)
+    all_keypoints.append(keypoints)
+    all_descriptors.append(descriptors)
+
+    feature_rows.append({
+        "image_index": len(valid_images) - 1,
+        "image": os.path.basename(path),
+        "keypoints": len(keypoints),
+        "descriptor_count": len(descriptors),
+        "feature_file": feature_path
+    })
+
+    if (i + 1) % 10 == 0 or i == len(image_paths) - 1:
+        print(f"Extracted features: {i + 1}/{len(image_paths)}")
+
+with open(
+    os.path.join(OUTPUT_DIR, "feature_summary.csv"),
+    "w", newline="", encoding="utf-8"
+) as f:
+    writer = csv.DictWriter(
+        f,
+        fieldnames=[
+            "image_index", "image", "keypoints",
+            "descriptor_count", "feature_file"
+        ]
+    )
+    writer.writeheader()
+    writer.writerows(feature_rows)
+
+print("\nFeature extraction completed.")
+
+# ============================================================
+# 5. MATCH CONSECUTIVE FRAMES + RANSAC + RECOVER POSE
+# ============================================================
+
+bf = cv2.BFMatcher(cv2.NORM_L2)
+motion_rows = []
+trajectory_rows = []
+
+position = np.zeros(3, dtype=np.float64)
+R_world_camera = np.eye(3, dtype=np.float64)
+
+for i in range(1, len(valid_images)):
+    kp1 = all_keypoints[i - 1]
+    kp2 = all_keypoints[i]
+    des1 = all_descriptors[i - 1]
+    des2 = all_descriptors[i]
+
+    row = {
+        "frame_from": os.path.basename(valid_images[i - 1]),
+        "frame_to": os.path.basename(valid_images[i]),
+        "good_matches": 0,
+        "ransac_inliers": 0,
+        "pose_success": 0,
+        "vo_x": float(position[0]),
+        "vo_y": float(position[1]),
+        "vo_z": float(position[2])
+    }
+
+    if len(des1) >= 2 and len(des2) >= 2:
+        pairs = bf.knnMatch(des1, des2, k=2)
+        good_matches = []
+
+        for pair in pairs:
+            if len(pair) == 2:
+                m, n = pair
+                if m.distance < RATIO_THRESHOLD * n.distance:
+                    good_matches.append(m)
+
+        row["good_matches"] = len(good_matches)
+
+        if len(good_matches) >= 8:
+            pts1 = np.float64([
+                kp1[m.queryIdx].pt for m in good_matches
+            ])
+            pts2 = np.float64([
+                kp2[m.trainIdx].pt for m in good_matches
+            ])
+
+            E, mask = cv2.findEssentialMat(
+                pts1, pts2, K,
+                method=cv2.RANSAC,
+                prob=0.999,
+                threshold=RANSAC_THRESHOLD
+            )
+
+            if E is not None and mask is not None and E.shape == (3, 3):
+                try:
+                    inliers, R, t, pose_mask = cv2.recoverPose(
+                        E, pts1, pts2, K, mask=mask.copy()
+                    )
+
+                    row["ransac_inliers"] = int(inliers)
+
+                    if inliers >= 8:
+                        # Monocular translation is direction-only,
+                        # so this is an arbitrary-scale trajectory.
+                        displacement = -R.T @ t.reshape(3)
+                        position += R_world_camera @ displacement
+                        R_world_camera = R_world_camera @ R.T
+                        row["pose_success"] = 1
+
+                        if i == 1 or i % 20 == 0:
+                            verified = [
+                                m for m, keep in zip(
+                                    good_matches,
+                                    pose_mask.ravel().astype(bool)
+                                ) if keep
+                            ]
+
+                            img1 = cv2.imread(valid_images[i - 1])
+                            img2 = cv2.imread(valid_images[i])
+
+                            vis = cv2.drawMatches(
+                                img1, kp1, img2, kp2,
+                                verified, None,
+                                flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+                            )
+
+                            cv2.imwrite(
+                                os.path.join(
+                                    MATCH_DIR, f"matches_{i:05d}.jpg"
+                                ),
+                                vis
+                            )
+
+                except cv2.error as e:
+                    print(f"Pose estimation failed at pair {i}: {e}")
+
+    row["vo_x"] = float(position[0])
+    row["vo_y"] = float(position[1])
+    row["vo_z"] = float(position[2])
+
+    motion_rows.append(row)
+    trajectory_rows.append(row.copy())
+
+    if i % 10 == 0 or i == len(valid_images) - 1:
+        print(
+            f"Processed pairs: {i}/{len(valid_images) - 1} | "
+            f"good matches={row['good_matches']} | "
+            f"inliers={row['ransac_inliers']}"
+        )
+
+# ============================================================
+# 6. SAVE MATCHING STATISTICS AND TRAJECTORY
+# ============================================================
+
+def save_csv(filename, rows):
+    if not rows:
+        return
+
+    with open(
+        os.path.join(OUTPUT_DIR, filename),
+        "w", newline="", encoding="utf-8"
+    ) as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+save_csv("motion_statistics.csv", motion_rows)
+save_csv("vo_trajectory.csv", trajectory_rows)
+
+# ============================================================
+# 7. PLOT RELATIVE VO TRAJECTORY
+# ============================================================
+
+if trajectory_rows:
+    xs = [r["vo_x"] for r in trajectory_rows]
+    ys = [r["vo_y"] for r in trajectory_rows]
+
+    plt.figure(figsize=(10, 8))
+    plt.plot(xs, ys, label="CAM_FRONT monocular VO")
+    plt.scatter(xs[0], ys[0], label="Start")
+    plt.scatter(xs[-1], ys[-1], label="End")
+    plt.xlabel("Relative X (arbitrary scale)")
+    plt.ylabel("Relative Y (arbitrary scale)")
+    plt.title("CAM_FRONT Visual Odometry Trajectory")
+    plt.axis("equal")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(
+        os.path.join(OUTPUT_DIR, "vo_trajectory.png"),
+        dpi=200
+    )
+    plt.show()
+
+successful = sum(r["pose_success"] for r in motion_rows)
+
+print("\n========== COMPLETE ==========")
+print("Images discovered:", len(image_paths))
+print("Images processed:", len(valid_images))
+print("Consecutive pairs:", len(motion_rows))
+print("Successful pose estimates:", successful)
+
+if motion_rows:
+    print(
+        "Pose success rate:",
+        round(100 * successful / len(motion_rows), 2), "%"
+    )
+
+print("Results saved in:", OUTPUT_DIR)
